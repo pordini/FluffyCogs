@@ -52,10 +52,10 @@ class Options(Flag):
         except Exception:
             if args or kwargs:
                 raise
-            return cls._convert(value)
+            return cls._conv(value)
 
     @classmethod
-    def _convert(cls, argument: str):
+    def _conv(cls, argument: str):
         argument = argument.upper().rstrip("S")
         try:
             return cls[argument]
