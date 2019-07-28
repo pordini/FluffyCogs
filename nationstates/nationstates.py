@@ -3,14 +3,10 @@ import contextlib
 import discord
 import re
 from datetime import datetime
-from enum import Flag, auto
-from functools import reduce, partial
 from html import unescape
 from io import BytesIO
-from operator import or_
-from typing import Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
-# pylint: disable=E0611
 import sans
 from sans.errors import HTTPException, NotFound
 from sans.api import Api
@@ -18,50 +14,14 @@ from sans.api import Api
 from redbot.core import checks, commands, Config, version_info as red_version
 from redbot.core.utils.chat_formatting import box, pagify, escape
 
-# pylint: disable=E0401
+# pylint: disable=import-error
 from cog_shared.proxyembed import ProxyEmbed
+from .types import Nation, Region, NSC, WAOptions
 
 listener = getattr(commands.Cog, "listener", lambda: lambda x: x)
 
 
-LINK_RE = re.compile(
-    r"(?i)\b(?:https?:\/\/)?(?:www\.)?nationstates\.net\/(?:(nation|region)=)?([-\w\s]+)\b"
-)
 WA_RE = re.compile(r"(?i)\b(UN|GA|SC)R?#(\d+)\b")
-
-
-class Options(Flag):
-    @classmethod
-    def convert(cls, argument: str):
-        argument = argument.upper().rstrip("S")
-        try:
-            return cls[argument]
-        except KeyError as ke:
-            raise commands.BadArgument() from ke
-
-    @classmethod
-    def collapse(cls, *args: "WAOptions", default: Union["WAOptions", int] = 0):
-        if not args:
-            return cls(default)
-        return cls(reduce(or_, args))
-
-
-class WAOptions(Options):
-    ALL = -1
-    NONE = 0
-    TEXT = auto()
-    VOTE = auto()
-    NATION = auto()
-    DELEGATE = auto()
-
-
-def link_extract(link: str, *, expected):
-    match = LINK_RE.match(link)
-    if not match:
-        return link
-    if (match.group(1) or "nation").lower() != expected.lower():
-        raise commands.BadArgument()
-    return match.group(2)
 
 
 class NationStates(commands.Cog):
@@ -134,9 +94,9 @@ class NationStates(commands.Cog):
         await ctx.send(f"Agent set: {Api.agent}")
 
     @commands.command()
-    async def nation(self, ctx, *, nation: partial(link_extract, expected="nation")):
+    async def nation(self, ctx, *, nation: NSC[Nation]):
         """Retrieves general info about a specified NationStates nation"""
-        nation = Api(
+        api: Api = Api(
             "census category dbid demonym2plural",
             "flag founded freedom fullname",
             "influence lastlogin motto name",
@@ -146,9 +106,9 @@ class NationStates(commands.Cog):
             scale="65 66",
         )
         try:
-            root = await nation
+            root = await api
         except NotFound:
-            nation = nation["nation"]
+            nation = api["nation"]
             embed = ProxyEmbed(
                 title=nation.replace("_", " ").title(),
                 url="https://www.nationstates.net/page="
@@ -160,7 +120,7 @@ class NationStates(commands.Cog):
             return await embed.send_to(ctx)
         except HTTPException as e:
             return await ctx.send(f"{e.status}: {e.message}")
-        endo = int(root[".//SCALE[@id='66']/SCORE"])
+        endo = root["CENSUS/SCALE[@id='66']/SCORE"]
         if endo == 1:
             endo = "{:d} endorsement".format(endo)
         else:
@@ -195,7 +155,7 @@ class NationStates(commands.Cog):
         embed.add_field(
             name=root["UNSTATUS"],
             value="{} | {:d} influence ({})".format(
-                endo, int(root[".//SCALE[@id='65']/SCORE"]), root["INFLUENCE"]
+                endo, int(root["CENSUS/SCALE[@id='65']/SCORE"]), root["INFLUENCE"]
             ),
             inline=False,
         )
@@ -212,63 +172,50 @@ class NationStates(commands.Cog):
         await embed.send_to(ctx)
 
     @commands.command()
-    async def region(self, ctx, *, region: partial(link_extract, expected="region")):
+    async def region(self, ctx, *, region: NSC[Region]):
         """Retrieves general info about a specified NationStates region"""
-        region = Api(
-            "delegate delegateauth flag founded founder lastupdate name numnations power",
+        api: Api = Api(
+            "delegate delegateauth delegatevotes flag founded founder founderauth lastupdate name numnations power",
             region=region,
         )
         try:
-            root = await region
+            root = await api
         except HTTPException as e:
             if e.status != 404:
                 return await ctx.send(f"{e.status}: {e.message}")
-            region = region["region"]
+            region = api["region"]
             embed = ProxyEmbed(
                 title=region.replace("_", " ").title(), description="This region does not exist."
             )
             embed.set_author(name="NationStates", url="https://www.nationstates.net/")
             return await embed.send_to(ctx)
         if root["DELEGATE"] == 0:
-            root["DELEGATE"] = "No Delegate"
+            delvalue = "No Delegate"
         else:
-            delroot = await Api(
-                "census fullname influence", nation=root["DELEGATE"], scale="65 66", mode="score"
-            )
-            endo = int(delroot[".//SCALE[@id='66']/SCORE"])
+            endo = root["DELEGATEVOTES"] - 1
             if endo == 1:
                 endo = "{:d} endorsement".format(endo)
             else:
                 endo = "{:d} endorsements".format(endo)
-            root["DELEGATE"] = (
-                "[{}](https://www.nationstates.net/nation={})"
-                " | {} | {:d} influence ({})".format(
-                    delroot["FULLNAME"],
-                    root["DELEGATE"],
-                    endo,
-                    int(delroot[".//SCALE[@id='65']/SCORE"]),
-                    delroot["INFLUENCE"],
-                )
+            delvalue = "[{}](https://www.nationstates.net/nation={}) | {}".format(
+                root["DELEGATE"].replace("_", " ").title(), root["DELEGATE"], endo
             )
         if "X" in root["DELEGATEAUTH"]:
-            root["DELEGATEAUTH"] = ""
+            delheader = "Delegate"
         else:
-            root["DELEGATEAUTH"] = " (Non-Executive)"
+            delheader = "Delegate (Non-Executive)"
         if root["FOUNDED"] == 0:
             root["FOUNDED"] = "in Antiquity"
         if root["FOUNDER"] == 0:
             root["FOUNDER"] = "No Founder"
         else:
-            try:
-                root["FOUNDER"] = "[{}](https://www.nationstates.net/" "nation={})".format(
-                    (await Api("fullname", nation=root["FOUNDER"]))["FULLNAME"], root["FOUNDER"]
-                )
-            except HTTPException as e:
-                if e.status != 404:
-                    return await ctx.send(f"{e.status}: {e.message}")
-                root["FOUNDER"] = "{} (Ceased to Exist)".format(
-                    root["FOUNDER"].replace("_", " ").capitalize()
-                )
+            root["FOUNDER"] = "[{}](https://www.nationstates.net/nation={})".format(
+                root["FOUNDER"].replace("_", " ").title(), root["FOUNDER"]
+            )
+        if root["FOUNDERAUTH"] and "X" in root["FOUNDERAUTH"]:
+            founderheader = "Founder"
+        else:
+            founderheader = "Founder (Non-Executive)"
         embed = ProxyEmbed(
             title=root["NAME"],
             url="https://www.nationstates.net/region={}".format(root.get("id")),
@@ -282,17 +229,15 @@ class NationStates(commands.Cog):
         embed.set_author(name="NationStates", url="https://www.nationstates.net/")
         if root["FLAG"]:
             embed.set_thumbnail(url=root["FLAG"])
-        embed.add_field(name="Founder", value=root["FOUNDER"], inline=False)
-        embed.add_field(
-            name="Delegate{}".format(root["DELEGATEAUTH"]), value=root["DELEGATE"], inline=False
-        )
+        embed.add_field(name=founderheader, value=root["FOUNDER"], inline=False)
+        embed.add_field(name=delheader, value=delvalue, inline=False)
         embed.set_footer(text="Last Updated")
         await embed.send_to(ctx)
 
     # __________ ASSEMBLY __________
 
     @commands.command(aliases=["ga", "sc"])
-    async def wa(self, ctx, resolution_id: Optional[int] = None, *options: WAOptions.convert):
+    async def wa(self, ctx, resolution_id: Optional[int] = None, *options: WAOptions):
         """
         Retrieves general info about World Assembly resolutions.
 
@@ -304,21 +249,22 @@ class NationStates(commands.Cog):
             nations - The total nations for and against
             delegates - The top ten Delegates for and against
         """
-        options = reduce(lambda x, y: x | y, options) if options else WAOptions.NONE
-        if resolution_id and options & (WAOptions.NATION | WAOptions.DELEGATE):
+        option = WAOptions.reduce(*options, default=0)
+        if resolution_id and option & (WAOptions.NATION | WAOptions.DELEGATE):
             return await ctx.send(
                 "The Nations and Delegates options are not available for past resolutions."
             )
         is_sc = ctx.invoked_with == "sc"
         try:
-            request = {"q": ["resolution"], "wa": "2" if is_sc else "1"}
-            if options & WAOptions.DELEGATE:
-                request["q"].append("delvotes")
+            shards = ["resolution"]
+            request = {"wa": "2" if is_sc else "1"}
+            if option & WAOptions.DELEGATE:
+                shards.append("delvotes")
             if resolution_id:
                 request["id"] = str(resolution_id)
             else:
-                request["q"].append("lastresolution")
-            root = await Api(request)
+                shards.append("lastresolution")
+            root = await Api(request, q=shards)
         except HTTPException as e:
             return await ctx.send(f"{e.status}: {e.message}")
         img = "4dHt6si" if is_sc else "7EMYsJ6"
@@ -343,7 +289,7 @@ class NationStates(commands.Cog):
             embed.set_thumbnail(url="http://i.imgur.com/{}.jpg".format(img))
             return await embed.send_to(ctx)
         root = root["RESOLUTION"]
-        if options & WAOptions.TEXT:
+        if option & WAOptions.TEXT:
             description = "**Category: {}**\n\n{}".format(
                 root["CATEGORY"], escape(root["DESC"], formatting=True)
             )
@@ -363,7 +309,8 @@ class NationStates(commands.Cog):
         if resolution_id:
             impl = root["IMPLEMENTED"]
         else:
-            impl = root["PROMOTED"] + (4 * 24 * 60 * 60)  # 4 Days
+            # mobile embeds can't handle the FUTURE
+            impl = root["PROMOTED"]  # + (4 * 24 * 60 * 60)  # 4 Days
         embed = ProxyEmbed(
             title=root["NAME"],
             url="https://www.nationstates.net/page={}".format("sc" if is_sc else "ga")
@@ -394,7 +341,7 @@ class NationStates(commands.Cog):
                 icon_url=authroot["FLAG"],
             )
         embed.set_thumbnail(url="http://i.imgur.com/{}.jpg".format(img))
-        if options & WAOptions.DELEGATE:
+        if option & WAOptions.DELEGATE:
             for_del_votes = sorted(
                 root.iterfind("DELVOTES_FOR/DELEGATE"), key=lambda e: e["VOTES"], reverse=True
             )[:10]
@@ -423,7 +370,7 @@ class NationStates(commands.Cog):
                     ),
                     inline=False,
                 )
-        if options & WAOptions.VOTE:
+        if option & WAOptions.VOTE:
             percent = (
                 100
                 * root["TOTAL_VOTES_FOR"]
@@ -437,7 +384,7 @@ class NationStates(commands.Cog):
                     root["TOTAL_VOTES_AGAINST"],
                 ),
             )
-        if options & WAOptions.NATION:
+        if option & WAOptions.NATION:
             percent = (
                 100
                 * root["TOTAL_NATIONS_FOR"]
@@ -451,7 +398,7 @@ class NationStates(commands.Cog):
                     root["TOTAL_NATIONS_AGAINST"],
                 ),
             )
-        embed.set_footer(text="Passed" if resolution_id else "Voting Closes")
+        embed.set_footer(text="Passed" if resolution_id else "Voting Started")
         await embed.send_to(ctx)
 
     # __________ SHARD __________
@@ -470,10 +417,10 @@ class NationStates(commands.Cog):
         """
         if not shards:
             return await ctx.send_help()
-        request = {}
+        request: dict = {}
         key = "q"
         for i, shard in enumerate(shards):
-            if shard.startswith("--"):
+            if shard.startswith(("--", "—")):
                 if key != "q":
                     return await ctx.send("No value provided for key {!r}".format(key))
                 key = shard[2:]
@@ -501,7 +448,7 @@ class NationStates(commands.Cog):
             root = await Api("endorsements fullname wa", nation=wa_nation)
         except HTTPException as e:
             return await ctx.send(f"{e.status}: {e.message}")
-        if root["UNSTATUS"].lower() == "non-member":
+        if root["UNSTATUS"] == "Non-member":
             return await ctx.send(f"{root['FULLNAME']} is not a WA member.")
         await ctx.send(
             "Nations endorsing " + root["FULLNAME"],
@@ -515,11 +462,11 @@ class NationStates(commands.Cog):
             root = await Api("census fullname wa", nation=wa_nation, scale="66", mode="score")
         except HTTPException as e:
             return await ctx.send(f"{e.status}: {e.message}")
-        if root["UNSTATUS"].lower() == "non-member":
+        if root["UNSTATUS"] == "Non-member":
             return await ctx.send(f"{root['FULLNAME']} is not a WA member.")
         await ctx.send(
             "{:.0f} nations are endorsing {}".format(
-                root[".//SCALE[@id='66']/SCORE"], root["FULLNAME"]
+                root["CENSUS/SCALE[@id='66']/SCORE"], root["FULLNAME"]
             )
         )
 
@@ -531,7 +478,9 @@ class NationStates(commands.Cog):
         except HTTPException as e:
             return await ctx.send(f"{e.status}: {e.message}")
         await ctx.send(
-            "{} has {:.0f} influence".format(root["FULLNAME"], root[".//SCALE[@id='65']/SCORE"])
+            "{} has {:.0f} influence".format(
+                root["FULLNAME"], root["CENSUS/SCALE[@id='65']/SCORE"]
+            )
         )
 
     @commands.command()
@@ -541,7 +490,7 @@ class NationStates(commands.Cog):
             nation_root = await Api("endorsements fullname region wa", nation=wa_nation)
         except HTTPException as e:
             return await ctx.send(f"{e.status}: {e.message}")
-        if nation_root["UNSTATUS"].lower() == "non-member":
+        if nation_root["UNSTATUS"] == "Non-member":
             return await ctx.send(f"{nation_root['FULLNAMENAME']} is not a WA member.")
         wa_root = await Api("members", wa="1")
         region_root = await Api("nations", region=nation_root["REGION"])
@@ -562,7 +511,7 @@ class NationStates(commands.Cog):
             nation_root = await Api("endorsements fullname region wa", nation=wa_nation)
         except HTTPException as e:
             return await ctx.send(f"{e.status}: {e.message}")
-        if nation_root["UNSTATUS"].lower() == "non-member":
+        if nation_root["UNSTATUS"] == "Non-member":
             return await ctx.send(f"{nation_root['NAME']} is not a WA member.")
         wa_root = await Api("members", wa="1")
         region_root = await Api("nations", region=nation_root["REGION"])
