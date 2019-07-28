@@ -49,7 +49,7 @@ class Options(Flag):
             return super().__call__(value, *args, **kwargs)
         except AttributeError as e:
             raise TypeError(f"{cls.__name__!r} object is not callable") from e
-        except ValueError:
+        except Exception:
             if args or kwargs:
                 raise
             return cls._convert(value)
