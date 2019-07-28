@@ -45,14 +45,20 @@ class Options(Flag):
     @classmethod
     def __call__(cls, value, *args, **kwargs):
         try:
-            # pylint: disable=no-member
-            return super().__call__(value, *args, **kwargs)
-        except AttributeError as e:
-            raise TypeError(f"{cls.__name__!r} object is not callable") from e
-        except Exception:
-            if args or kwargs:
-                raise
-            return cls._conv(value)
+            try:
+                # pylint: disable=no-member
+                return super().__call__(value, *args, **kwargs)
+            except AttributeError as e:
+                raise TypeError(f"{cls.__name__!r} object is not callable") from e
+            except Exception:
+                if args or kwargs:
+                    raise
+                return cls._conv(value)
+        except:
+            import traceback
+
+            traceback.print_exc()
+            raise
 
     @classmethod
     def _conv(cls, argument: str):
