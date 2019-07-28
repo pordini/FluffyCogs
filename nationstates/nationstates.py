@@ -122,9 +122,9 @@ class NationStates(commands.Cog):
             return await ctx.send(f"{e.status}: {e.message}")
         endo = root["CENSUS/SCALE[@id='66']/SCORE"]
         if endo == 1:
-            endo = "{:d} endorsement".format(endo)
+            endo = "{:.0f} endorsement".format(endo)
         else:
-            endo = "{:d} endorsements".format(endo)
+            endo = "{:.0f} endorsements".format(endo)
         if root["FOUNDED"] == 0:
             root["FOUNDED"] = "in Antiquity"
         embed = ProxyEmbed(
@@ -154,8 +154,8 @@ class NationStates(commands.Cog):
         )
         embed.add_field(
             name=root["UNSTATUS"],
-            value="{} | {:d} influence ({})".format(
-                endo, int(root["CENSUS/SCALE[@id='65']/SCORE"]), root["INFLUENCE"]
+            value="{} | {:.0f} influence ({})".format(
+                endo, root["CENSUS/SCALE[@id='65']/SCORE"], root["INFLUENCE"]
             ),
             inline=False,
         )
@@ -194,9 +194,9 @@ class NationStates(commands.Cog):
         else:
             endo = root["DELEGATEVOTES"] - 1
             if endo == 1:
-                endo = "{:d} endorsement".format(endo)
+                endo = "{:.0f} endorsement".format(endo)
             else:
-                endo = "{:d} endorsements".format(endo)
+                endo = "{:.0f} endorsements".format(endo)
             delvalue = "[{}](https://www.nationstates.net/nation={}) | {}".format(
                 root["DELEGATE"].replace("_", " ").title(), root["DELEGATE"], endo
             )
