@@ -3,11 +3,29 @@
 # this was a lot of work just to make mypy shut up...
 import re
 from enum import EnumMeta, Flag, auto
-from functools import reduce, partial
+from functools import partial, reduce, wraps
 from operator import or_
 from typing import Any, Callable, Generic, Iterable, Optional, NewType, Tuple, Type, TypeVar, Union
 
 from redbot.core import commands
+
+
+import traceback
+
+
+def _dec(func):
+    @wraps(func)
+    async def inner(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except:
+            traceback.print_exc()
+            raise
+
+    return inner
+
+
+commands.Command._actual_conversion = _dec(commands.Command._actual_conversion)
 
 
 LINK_RE = re.compile(
