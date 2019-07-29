@@ -16,7 +16,7 @@ from redbot.core.utils.chat_formatting import box, pagify, escape
 
 # pylint: disable=import-error
 from cog_shared.proxyembed import ProxyEmbed
-from .types import Nation, Region, NSC, WAOptions
+from .types import Nation, Region, WA, GA, SC, Link, Options
 
 listener = getattr(commands.Cog, "listener", lambda: lambda x: x)
 
@@ -94,7 +94,7 @@ class NationStates(commands.Cog):
         await ctx.send(f"Agent set: {Api.agent}")
 
     @commands.command()
-    async def nation(self, ctx, *, nation: NSC[Nation]):
+    async def nation(self, ctx, *, nation: Link[Nation]):
         """Retrieves general info about a specified NationStates nation"""
         api: Api = Api(
             "census category dbid demonym2plural",
@@ -172,7 +172,7 @@ class NationStates(commands.Cog):
         await embed.send_to(ctx)
 
     @commands.command()
-    async def region(self, ctx, *, region: NSC[Region]):
+    async def region(self, ctx, *, region: Link[Region]):
         """Retrieves general info about a specified NationStates region"""
         api: Api = Api(
             "delegate delegateauth delegatevotes flag founded founder founderauth lastupdate name numnations power",
@@ -237,7 +237,7 @@ class NationStates(commands.Cog):
     # __________ ASSEMBLY __________
 
     @commands.command(aliases=["ga", "sc"])
-    async def wa(self, ctx, resolution_id: Optional[int] = None, *options: WAOptions):
+    async def wa(self, ctx, resolution_id: Optional[Link[WA]] = None, *options: Options[WA]):
         """
         Retrieves general info about World Assembly resolutions.
 
@@ -249,8 +249,8 @@ class NationStates(commands.Cog):
             nations - The total nations for and against
             delegates - The top ten Delegates for and against
         """
-        option = WAOptions.reduce(*options, default=0)
-        if resolution_id and option & (WAOptions.NATION | WAOptions.DELEGATE):
+        option = Options[WA].reduce(options, default=0)
+        if resolution_id and option & (WA.NATION | WA.DELEGATE):
             return await ctx.send(
                 "The Nations and Delegates options are not available for past resolutions."
             )
@@ -258,7 +258,7 @@ class NationStates(commands.Cog):
         try:
             shards = ["resolution"]
             request = {"wa": "2" if is_sc else "1"}
-            if option & WAOptions.DELEGATE:
+            if option & WA.DELEGATE:
                 shards.append("delvotes")
             if resolution_id:
                 request["id"] = str(resolution_id)
@@ -289,7 +289,7 @@ class NationStates(commands.Cog):
             embed.set_thumbnail(url="http://i.imgur.com/{}.jpg".format(img))
             return await embed.send_to(ctx)
         root = root["RESOLUTION"]
-        if option & WAOptions.TEXT:
+        if option & WA.TEXT:
             description = "**Category: {}**\n\n{}".format(
                 root["CATEGORY"], escape(root["DESC"], formatting=True)
             )
@@ -341,7 +341,7 @@ class NationStates(commands.Cog):
                 icon_url=authroot["FLAG"],
             )
         embed.set_thumbnail(url="http://i.imgur.com/{}.jpg".format(img))
-        if option & WAOptions.DELEGATE:
+        if option & WA.DELEGATE:
             for_del_votes = sorted(
                 root.iterfind("DELVOTES_FOR/DELEGATE"), key=lambda e: e["VOTES"], reverse=True
             )[:10]
@@ -370,7 +370,7 @@ class NationStates(commands.Cog):
                     ),
                     inline=False,
                 )
-        if option & WAOptions.VOTE:
+        if option & WA.VOTE:
             percent = (
                 100
                 * root["TOTAL_VOTES_FOR"]
@@ -384,7 +384,7 @@ class NationStates(commands.Cog):
                     root["TOTAL_VOTES_AGAINST"],
                 ),
             )
-        if option & WAOptions.NATION:
+        if option & WA.NATION:
             percent = (
                 100
                 * root["TOTAL_NATIONS_FOR"]

@@ -2,10 +2,10 @@
 # pylint says, "what even is __class_getitem__"
 # this was a lot of work just to make mypy shut up...
 import re
-from enum import Flag, auto
+from enum import EnumMeta, Flag, auto
 from functools import reduce, partial
 from operator import or_
-from typing import Callable, Generic, NewType, TypeVar, Union
+from typing import Any, Callable, Generic, Iterable, Optional, NewType, Tuple, Type, TypeVar, Union
 
 from redbot.core import commands
 
@@ -13,94 +13,110 @@ from redbot.core import commands
 LINK_RE = re.compile(
     r"(?i)\b(?:https?:\/\/)?(?:www\.)?nationstates\.net\/(?:(nation|region)=)?([-\w\s]+)\b"
 )
+WA_RE = re.compile(
+    r"(?i)\b(?:https?:\/\/)?(?:www\.)?nationstates\.net\/page=wa_past_resolution\/id=(\d+)\/council=([12])\b"
+)
 
 
-def link_extract(link: str, *, expected):
+def link_extract(link: str, *, expected: str):
+    try:
+        index = ("wa", "ga", "sc").index(expected.casefold()) - 1
+    except IndexError:
+        pass
+    else:
+        return wa_link_extract(link, expected=index)
     match = LINK_RE.match(link)
     if not match:
         return link
-    if (match.group(1) or "nation").lower() != expected.lower():
+    if (match.group(1) or "nation").casefold() != expected.casefold():
         raise commands.BadArgument()
     return match.group(2)
 
 
-# TYPING
-Nation = NewType("Nation", object)
-Region = NewType("Region", object)
-T = TypeVar("T", Nation, Region)
-
-
-class NSC(str, Generic[T]):
-    @classmethod  # pylint says, "what even is an implied classmethod"
-    def __class_getitem__(cls, item):
-        if isinstance(item, tuple):
-            return Union[tuple(cls[t] for t in item)]
-        if item in (Nation, Region):
-            return partial(link_extract, expected=item.__name__.lower())
-        raise TypeError(f"Unknown generic type {item!r}.")
+def wa_link_extract(link: str, *, expected: int):
+    match = WA_RE.match(link)
+    if not match:
+        return link
+    if expected > 0 and match.group(2) != expected:
+        raise commands.BadArgument()
+    return match.group(1)
 
 
 # ENUMS
-class Options(Flag):
-    @classmethod
-    def __call__(cls, value, *args, **kwargs):
-        try:
-            try:
-                # pylint: disable=no-member
-                return super().__call__(value, *args, **kwargs)
-            except AttributeError as e:
-                raise TypeError(f"{cls.__name__!r} object is not callable") from e
-            except Exception:
-                if args or kwargs:
-                    raise
-                return cls._conv(value)
-        except:
-            import traceback
-
-            traceback.print_exc()
-            raise
-
-    @classmethod
-    def _conv(cls, argument: str):
-        argument = argument.upper().rstrip("S")
-        try:
-            return cls[argument]
-        except KeyError as ke:
-            raise commands.BadArgument() from ke
-
-    @classmethod
-    def reduce(
-        cls,
-        *args: "Options",
-        default: Union["Options", int] = 0,
-        func: Callable[["Options", "Options"], "Options"] = or_,
-    ):
-        if not args:
-            return cls(default)
-        return cls(reduce(func, args))
+class _Options(Flag):
+    pass
 
 
-class NationOptions(Options):
+class Nation(_Options):
     ALL = -1
     NONE = 0
-    STATS = auto()
+    STAT = auto()
     WA = auto()
     RMB = auto()
     CARDS = auto()
 
 
-class RegionOptions(Options):
+class Region(_Options):
     ALL = -1
     NONE = 0
     FOUNDER = auto()
     DELEGATE = auto()
-    TAGS = auto()
+    TAG = auto()
 
 
-class WAOptions(Options):
+class WA(_Options):
     ALL = -1
     NONE = 0
     TEXT = auto()
     VOTE = auto()
     NATION = auto()
     DELEGATE = auto()
+
+
+GA = NewType("GA", WA)
+SC = NewType("SC", WA)
+
+
+# TYPING
+T = TypeVar("T", bound=_Options)
+
+
+def _args(cls: type, *, supertype: bool = True, default: tuple = NotImplemented) -> tuple:
+    types = getattr(cls, "__args__", NotImplemented)
+    if types is NotImplemented:
+        if default is not NotImplemented:
+            return default
+        raise TypeError(f"Parameter list to {cls.__qualname__}[...] cannot be empty")
+    if supertype:
+        ret = []
+        for t in types:
+            while True:
+                try:
+                    t = t.__supertype__
+                except AttributeError:
+                    break
+            ret.append(t)
+        return tuple(ret)
+    else:
+        return types
+
+
+class Link(str, Generic[T]):
+    def __new__(cls, argument: str) -> str:
+        types: Tuple[Type[T], ...] = _args(cls, supertype=False)
+        return link_extract(argument, expected=types[0].__name__)
+
+
+class Options(Generic[T]):
+    def __new__(cls, argument: str) -> T:
+        types: Tuple[Type[T], ...] = _args(cls)
+        return types[0][argument.upper().rstrip("S")]
+
+    @classmethod
+    def reduce(
+        cls, args: Iterable, *, default: Union[T, int] = 0, operator: Callable[[T, T], T] = or_
+    ) -> T:
+        types: Tuple[Type[T], ...] = _args(cls)
+        if not args:
+            return types[0](default)
+        return types[0](reduce(operator, args))
