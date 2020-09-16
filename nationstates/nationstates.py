@@ -1,31 +1,29 @@
 import asyncio
 import bisect
-import discord
 import re
 import time
 from datetime import datetime
 from enum import Flag, auto
-from functools import reduce, partial
+from functools import partial, reduce
 from html import unescape
 from io import BytesIO
 from operator import or_
-from typing import Generic, Type, TypeVar, Optional, Union
+from typing import Generic, List, Optional, Type, TypeVar, Union
+
+import discord
+from proxyembed import ProxyEmbed
+from redbot.core import Config, checks, commands, version_info as red_version
+from redbot.core.utils.chat_formatting import box, escape, humanize_list, pagify
+from sans.api import Api
 
 # pylint: disable=E0611
 from sans.errors import HTTPException, NotFound
-from sans.api import Api
 from sans.utils import pretty_string
-
-from redbot.core import checks, commands, Config, version_info as red_version
-from redbot.core.utils.chat_formatting import pagify, escape, box
-
-# pylint: disable=E0401
-from cog_shared.proxyembed import ProxyEmbed
 
 
 class Options(Flag):
     @classmethod
-    def convert(cls, argument: str) -> "Options":
+    async def convert(cls, ctx, argument: str) -> "Options":
         argument = argument.upper().rstrip("S")
         try:
             return cls[argument]
@@ -90,6 +88,14 @@ class Link(str, Generic[T]):
 
 class NationStates(commands.Cog):
 
+    # __________ DATA API __________
+
+    async def red_get_data_for_user(self, *, user_id):
+        return {}  # No data to get
+
+    async def red_delete_data_for_user(self, *, requester, user_id):
+        pass  # No data to delete
+
     # __________ INIT __________
 
     def __init__(self, bot):
@@ -105,25 +111,24 @@ class NationStates(commands.Cog):
     async def initialize(self):
         agent = await self.config.agent()
         if not agent:
-            if not self.bot.owner_id:
-                # always False but forces owner_id to be filled
+            if not self.bot.owner_ids:
+                # always False but forces owner_ids to be filled
                 await self.bot.is_owner(discord.Object(id=None))
-            owner_id = self.bot.owner_id
+            owner_ids = self.bot.owner_ids
             # only make the user_info request if necessary
-            agent = str(self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id))
+            agent = humanize_list(
+                [str(self.bot.get_user(id) or await self.bot.fetch_user(id)) for id in owner_ids]
+            )
         Api.agent = f"{agent} Red-DiscordBot/{red_version}"
         self.db_cache = await self.config.custom("NATION").all()
 
-    def cog_check(self, ctx):
-        if not ctx.channel.permissions_for(ctx.me).send_messages:
-            raise commands.BotMissingPermissions(["send_messages"])
+    async def cog_before_invoke(self, ctx):
         # this will also cause `[p]agent` to be blocked but this is intended
         if ctx.cog is not self:
-            return True
+            return
         xra = Api.xra
         if xra:
             raise commands.CommandOnCooldown(None, time.time() - xra)
-        return True
 
     def cog_command_error(self, ctx, error):
         # not a coro but returns one anyway
@@ -171,11 +176,11 @@ class NationStates(commands.Cog):
                 )
                 continue
             ctx.invoked_with = match.group(1).lower()
-            await ctx.invoke(self.wa, int(res_id))
+            await ctx.invoke(self.wa, int(res_id), WA.NONE)
 
     # __________ STANDARD __________
 
-    @commands.command()
+    @commands.command(cooldown_after_parsing=True)
     @commands.cooldown(2, 3600)
     @checks.is_owner()
     async def agent(self, ctx, *, agent: str):
@@ -429,10 +434,11 @@ class NationStates(commands.Cog):
             value=box(root.MARKET_VALUE.text, lang="swift"),
             inline=False,
         )
-        sellers, buyers = [], []
+        sellers: List[str] = []
+        buyers: List[str] = []
         for market in root.MARKETS.iterchildren():
-            # negative price to reverse sorting
             if market.TYPE.text == "bid":
+                # negative price to reverse sorting
                 bisect.insort(
                     buyers, (-market.PRICE.pyval, market.NATION.text.replace("_", " ").title())
                 )
@@ -517,7 +523,7 @@ class NationStates(commands.Cog):
     # __________ ASSEMBLY __________
 
     @commands.command(aliases=["ga", "sc"])
-    async def wa(self, ctx, resolution_id: Optional[int] = None, *options: WA.convert):
+    async def wa(self, ctx, resolution_id: Optional[int] = None, *options: WA):
         """
         Retrieves general info about World Assembly resolutions.
 

@@ -1,11 +1,10 @@
 import asyncio
-import discord
 import numbers
 from typing import Generic, Optional, Type, TypeVar, Union
 
-from redbot.core import commands, Config, checks
+import discord
+from redbot.core import Config, checks, commands
 from redbot.core.utils.mod import get_audit_reason
-
 
 T = TypeVar("T", float, int)
 defaults = dict(channel=None, days=1, uses=0)
@@ -29,6 +28,12 @@ class NonNegative(numbers.Real, Generic[T]):
 
 
 class SecureInv(commands.Cog):
+    async def red_get_data_for_user(self, *, user_id):
+        return {}  # No data to get
+
+    async def red_delete_data_for_user(self, *, requester, user_id):
+        pass  # No data to delete
+
     def __init__(self, bot):
         super().__init__()
         self.bot = bot
@@ -57,6 +62,8 @@ class SecureInv(commands.Cog):
         Defaults can be set with `[p]inv set`.
         If no defaults are found, channel defaults to the current channel,
         days defaults to 1, and uses defaults to 0 (infinite).
+
+        Uses will always be finite if days is infinite.
         """
         settings = await self.config.guild(ctx.guild).all()
         if not channel:
@@ -69,7 +76,10 @@ class SecureInv(commands.Cog):
         if days is None:
             days = settings["days"]
         if uses is None:
-            uses = 0 if days else 1
+            if days:
+                uses = settings["uses"]
+            else:
+                uses = settings["uses"] or 1
         generated = []
         for i in range(amount or 1):
             generated.append(
