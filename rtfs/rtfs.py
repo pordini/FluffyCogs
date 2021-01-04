@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import inspect
+import logging
 import traceback
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -17,13 +18,45 @@ except ImportError:
     from redbot.vendored.discord.ext import menus
 
 
+LOG = logging.getLogger("red.fluffy.rtfs")
+
+
+class Unlicensed(Exception):
+    pass
+
+
 class SourceSource(menus.ListPageSource):
     def __init__(self, *args, header: str, **kwargs):
         super().__init__(*args, **kwargs)
         self.header = header
 
-    async def format_page(self, menu, page):
-        return f"{self.header}\n{box(page, lang='py')}\nPage {menu.current_page + 1} / {self.get_max_pages()}"
+    def format_page(self, menu, page):
+        try:
+            if page is None:
+                if self.header.startswith("<"):
+                    return self.header
+                return {}
+            return f"{self.header}\n{box(page, lang='py')}\nPage {menu.current_page + 1} / {self.get_max_pages()}"
+        except Exception as e:
+            # since d.py menus likes to suppress all errors
+            LOG.debug(exc_info=e)
+            raise
+
+
+class SourceMenu(menus.MenuPages):
+    async def finalize(self, timed_out):
+        try:
+            if self.message is None:
+                return
+            kwargs = await self._get_kwargs_from_page(None)
+            if not kwargs:
+                await self.message.delete()
+            else:
+                await self.message.edit(**kwargs)
+        except Exception as e:
+            # since d.py menus likes to suppress all errors
+            LOG.debug(exc_info=e)
+            raise
 
 
 class Env(dict):
@@ -85,7 +118,6 @@ class RTFS(commands.Cog):
                 if discord.__version__[-1].isdigit():
                     dpy_commit = "v" + discord.__version__
                 else:
-                    assert discord.__version__.startswith("1.")
                     try:
                         dpy_version = version("discord.py").split("+g")
                     except PackageNotFoundError:
@@ -96,7 +128,6 @@ class RTFS(commands.Cog):
             elif full_module.startswith("redbot."):
                 is_installed = True
                 if "dev" in redbot.__version__:
-                    assert redbot.__version__.startswith("3.")
                     red_commit = "V3/develop"
                 else:
                     red_commit = redbot.__version__
@@ -107,10 +138,19 @@ class RTFS(commands.Cog):
                     if installable.repo is None:
                         is_installed = False
                     else:
-                        url = yarl.URL(installable.repo.url)
-                        if url.user or url.password:
-                            is_installed = False
-                        header = f"<{installable.repo.clean_url.rstrip('/')}/blob/{installable.commit}/{full_module.replace('.', '/')}.py#L{line}-L{line + len(lines) - 1}>"
+                        if (
+                            "mikeshardmind" in installable.repo.url.lower()
+                            or "sinbad" in installable.repo.url.lower()
+                        ):
+                            # Sinbad's license specifically disallows redistribution of code, as per Section 3.
+                            #   Ref: https://github.com/mikeshardmind/SinbadCogs/blob/9cdcd042d57cc39c7330fcda50ecf580c055c313/LICENSE#L73-L76
+                            # Raising OSError here will prevent even bot owners from viewing the code.
+                            raise Unlicensed()
+                        else:
+                            url = yarl.URL(installable.repo.url)
+                            if url.user or url.password:
+                                is_installed = False
+                            header = f"<{installable.repo.clean_url.rstrip('/')}/blob/{installable.commit}/{full_module.replace('.', '/')}.py#L{line}-L{line + len(lines) - 1}>"
         if not is_installed and not is_owner:
             # don't disclose the source of private cogs
             raise OSError()
@@ -124,8 +164,8 @@ class RTFS(commands.Cog):
                 "".join(lines).replace("```", "`\u200b`\u200b`"), shorten_by=10, page_length=1024
             )
         )
-        await menus.MenuPages(
-            SourceSource(raw_pages, per_page=1, header=header), delete_message_after=True
+        await SourceMenu(
+            SourceSource(raw_pages, per_page=1, header=header), clear_reactions_after=True
         ).start(ctx)
 
     @commands.command(aliases=["rts", "source"])
@@ -144,6 +184,10 @@ class RTFS(commands.Cog):
                 return await self.format_and_send(ctx, obj, is_owner=is_owner)
         except OSError:
             return await ctx.send(f"I couldn't find source file for `{thing}`")
+        except Unlicensed:
+            return await ctx.send(
+                f"The source code for `{thing}` is copyrighted under too strict a license for me to show it here."
+            )
         dev = ctx.bot.get_cog("Dev")
         if not is_owner or not dev:
             raise commands.UserFeedbackCheckFailure(
@@ -159,7 +203,7 @@ class RTFS(commands.Cog):
             message=ctx.message,
             asyncio=asyncio,
             commands=commands,
-            __name__="__main__",
+            dpy_commands=discord.ext.commands,
         )
         try:
             obj = eval(thing, env)

@@ -7,10 +7,12 @@ import contextlib
 import importlib
 import inspect
 import io
+import sys
 import textwrap
 import traceback
 import types
 from copy import copy
+from itertools import chain
 from typing import Any, Dict, List, Optional
 
 import discord
@@ -21,10 +23,6 @@ from redbot.core.utils.predicates import MessagePredicate
 _features = [getattr(__future__, fname) for fname in __future__.all_feature_names]
 
 _ = dev_commands._
-try:
-    fetch_message = discord.abc.Messageable.fetch_message_fast
-except AttributeError:
-    fetch_message = discord.abc.Messageable.fetch_message
 
 
 # This is taken straight from stdlib's codeop,
@@ -50,7 +48,7 @@ class Env(Dict[str, Any]):
         self.imported = []
 
     @classmethod
-    def from_context(cls, ctx: commands.Context, **kwargs: Any) -> "Env":
+    def from_context(cls, ctx: commands.Context, /, **kwargs: Any) -> "Env":
         self = cls(
             {
                 # "_": None,  # let __builtins__ handle this one
@@ -79,13 +77,28 @@ class Env(Dict[str, Any]):
 
     def __missing__(self, key):
         try:
+            return getattr(builtins, key)
+        except AttributeError:
+            pass
+        try:
             module = importlib.import_module(key)
         except ImportError:
-            raise KeyError(key) from None
+            pass
         else:
             self.imported.append(key)
             self[key] = module
             return module
+        dotkey = "." + key
+        for tlms in ["redbot", "discord"]:
+            modules = [
+                v for k, v in sys.modules.items() if k.endswith(dotkey) and k.startswith(tlms)
+            ]
+            if len(modules) == 1:
+                module = modules[0]
+                self.imported.append(f"{module.__name__} as {key}")
+                self[key] = module
+                return module
+        raise KeyError(key)
 
     def get_formatted_imports(self) -> Optional[str]:
         if not self.imported:
@@ -100,7 +113,7 @@ class Dev(dev_commands.Dev):
     """Various development focused utilities."""
 
     # Schema: [my version] <[targeted bot version]>
-    __version__ = "0.0.1 <3.4.1dev>"
+    __version__ = "0.0.2 <3.4.1dev>"
 
     def __init__(self):
         super().__init__()
@@ -114,10 +127,31 @@ class Dev(dev_commands.Dev):
         else:
             return f"Cog Version: {self.__version__}"
 
-    async def my_exec(
+    async def my_exec(self, ctx: commands.Context, *args, **kwargs) -> None:
+        tasks = [
+            ctx.bot.wait_for("message", check=MessagePredicate.cancelled(ctx)),
+            self._my_exec(ctx, *args, **kwargs),
+        ]
+        async with ctx.typing():
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            result = task.result()
+            if not result:
+                # _my_exec finished
+                return
+            # wait_for finished
+            assert isinstance(result, discord.Message)
+            if not ctx.channel.permissions_for(
+                ctx.me
+            ).add_reactions or not await ctx.react_quietly("\N{CROSS MARK}"):
+                await ctx.send("Cancelled.")
+
+    async def _my_exec(
         self,
-        source,
         ctx: commands.Context,
+        source,
         env: Dict[str, Any],
         *modes: str,
         run: str = None,
@@ -125,9 +159,7 @@ class Dev(dev_commands.Dev):
         **environ: Any,
     ) -> None:
         compiler = compiler or Compiler()
-        original_message = discord.utils.get(
-            ctx.bot.cached_messages, id=ctx.message.id
-        ) or await fetch_message(ctx, ctx.message.id)
+        original_message = discord.utils.get(ctx.bot.cached_messages, id=ctx.message.id)
         if original_message:
             is_alias = not original_message.content.startswith(ctx.prefix + ctx.invoked_with)
         else:
@@ -153,7 +185,7 @@ class Dev(dev_commands.Dev):
                     else:
                         if run:
                             # don't call the func here, leave it to maybe_await
-                            output = await self.maybe_await(env[run])
+                            output = await self.maybe_await(env[run]())
                         if output is not None:
                             setattr(builtins, "_", output)
                             ret[3] = f"# Result:\n{output!r}"
@@ -175,11 +207,17 @@ class Dev(dev_commands.Dev):
                 limit = i - j
             else:
                 limit = i - j - 1
-            ret[2] = "# Exception:\n" + traceback.format_exc(limit=limit)
+            tb = e.__traceback__ if limit else None
+            ret[2] = "".join(
+                chain(["# Exception:\n"], traceback.format_exception(type(e), e, tb, limit))
+            )
         # don't export imports on aliases
-        if not is_alias and getattr(env, "imported", None):
-            assert isinstance(env, Env)
-            ret[0] = f"# Imported:\n{env.get_formatted_imports()}"
+        if (
+            not is_alias
+            and (method := getattr(env, "get_formatted_imports", None))
+            and (imported := method())
+        ):
+            ret[0] = f"# Imported:\n{imported}"
         printed = stdout.getvalue().strip()
         if printed:
             ret[1] = "# Output:\n" + printed
@@ -215,22 +253,21 @@ class Dev(dev_commands.Dev):
 
     @staticmethod
     async def maybe_await(coro):
-        if inspect.isroutine(coro):
-            with contextlib.suppress(TypeError):
-                coro = coro()
-
-        if inspect.isawaitable(coro):
-            return await coro
-        elif inspect.isasyncgen(coro):
+        if inspect.isasyncgen(coro):
             async for obj in coro:
                 if obj is not None:
                     setattr(builtins, "_", obj)
                     print(repr(obj))
+
+        elif inspect.isawaitable(coro):
+            return await coro
+
         elif inspect.isgenerator(coro):
             for obj in coro:
                 if obj is not None:
                     setattr(builtins, "_", obj)
                     print(repr(obj))
+
         else:
             return coro
 
@@ -265,7 +302,7 @@ class Dev(dev_commands.Dev):
                 )
                 return
 
-        await self.my_exec(code, ctx, env, "eval", "single", compiler=compiler)
+        await self.my_exec(ctx, code, env, "eval", "single", compiler=compiler)
 
     @commands.command(name="eval")
     @commands.is_owner()
@@ -305,7 +342,7 @@ class Dev(dev_commands.Dev):
                 return
 
         to_compile = "async def func():\n" + textwrap.indent(body, "  ")
-        await self.my_exec(to_compile, ctx, env, "exec", compiler=compiler, run="func")
+        await self.my_exec(ctx, to_compile, env, "exec", compiler=compiler, run="func")
 
     @staticmethod
     def handle_future(code: str, compiler: Compiler) -> str:
@@ -377,8 +414,8 @@ class Dev(dev_commands.Dev):
                     continue
 
             await self.my_exec(
-                cleaned,
                 ctx,
+                cleaned,
                 variables,
                 "eval",
                 "single",
