@@ -31,7 +31,6 @@ from redbot.core.utils import AsyncIter, deduplicate_iterables, mod
 from redbot.core.utils.chat_formatting import humanize_list, pagify, quote
 from redbot.core.utils.common_filters import filter_invites
 from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
-from redbot.core.utils.predicates import MessagePredicate
 
 from .graph import SimpleGraph, Vector
 
