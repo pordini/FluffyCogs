@@ -179,15 +179,14 @@ class Rift(commands.Cog):
     # COMMANDS
 
     @commands.command()
-    async def send(self, ctx: commands.Context, rifts: Messageable, message: str):
+    async def send(self, ctx, message: str, *, rifts: str):
         """
         Send a message to the specified destinations.
 
         Editing or deleting the message you send will still forward
         to the bot's reposts, as in normal rifts.
         """
-        unique_rifts = deduplicate_iterables(rifts)
-        await self._send(message, unique_rifts)
+        await self._send(message, rifts)
 
     @commands.group()
     async def rift(self, ctx: commands.Context):
