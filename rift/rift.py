@@ -31,6 +31,7 @@ from redbot.core.utils import AsyncIter, deduplicate_iterables, mod
 from redbot.core.utils.chat_formatting import humanize_list, pagify, quote
 from redbot.core.utils.common_filters import filter_invites
 from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
+from redbot.core.utils.predicates import MessagePredicate
 
 from .graph import SimpleGraph, Vector
 
@@ -179,14 +180,21 @@ class Rift(commands.Cog):
     # COMMANDS
 
     @commands.command()
-    async def send(self, ctx, message: str, rifts: str):
+    async def send(self, ctx: commands.Context, *rifts: Messageable):
         """
         Send a message to the specified destinations.
 
         Editing or deleting the message you send will still forward
         to the bot's reposts, as in normal rifts.
         """
-        await self._send(message, rifts)
+        if not rifts:
+            raise commands.UserInputError()
+        unique_rifts = deduplicate_iterables(rifts)
+        await ctx.send("What would you like to say?")
+        p = MessagePredicate.same_context(ctx=ctx)
+        message = await ctx.bot.wait_for("message", check=p)
+        await self._send(message, unique_rifts)
+        await message.reply("Your message has been sent.", mention_author=False)
 
     @commands.group()
     async def rift(self, ctx: commands.Context):
