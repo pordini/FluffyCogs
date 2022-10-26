@@ -4,25 +4,200 @@ import ast
 import asyncio
 import builtins
 import contextlib
+import functools
 import importlib
 import inspect
 import io
+import itertools
+import logging
 import sys
 import textwrap
-import traceback
 import types
-from copy import copy
-from itertools import chain
-from typing import Any, Dict, List, Optional
+from contextvars import ContextVar
+from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
+from typing_extensions import ParamSpec
+from weakref import WeakSet
 
 import discord
+import rich
+from pygments.styles import get_style_by_name
 from redbot.core import commands, dev_commands
+from redbot.core.bot import Red
+from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils.predicates import MessagePredicate
 
 # From stdlib's codeop
-_features = [getattr(__future__, fname) for fname in __future__.all_feature_names]
+_features: List[__future__._Feature] = [
+    getattr(__future__, fname) for fname in __future__.all_feature_names
+]
 
-_ = dev_commands._
+logger = logging.getLogger("red.fluffy.dev")
+_: Callable[[str], str] = dev_commands._
+ctxconsole = ContextVar[rich.console.Console]("ctxconsole")
+T = TypeVar("T")
+P = ParamSpec("P")
+
+
+class SolarizedCustom(get_style_by_name("solarized-dark")):
+    background_color = None
+    line_number_background_color = None
+
+
+def log_exceptions(func: Callable[P, Any]) -> Callable[P, Any]:
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            logger.exception("Exception in function %s", func.__name__)
+            raise
+
+    return wrapper
+
+
+@contextlib.asynccontextmanager
+async def redirect(**kwargs):
+    if "file" not in kwargs:
+        kwargs["file"] = file = io.StringIO()
+    else:
+        file = None
+    console = rich.console.Console(**kwargs)
+    token = ctxconsole.set(console)
+    try:
+        yield console
+    finally:
+        ctxconsole.reset(token)
+        if file:
+            file.close()
+
+
+class Patcher(Generic[T, P]):
+    patchers: "WeakSet[Patcher[T, P]]" = WeakSet()
+
+    def __new__(cls, original: Callable[P, T], new: Callable[P, T]):
+        if isinstance(new, cls):
+            new = new.new
+        if isinstance(original, cls):
+            # just redirect it
+            original.new = new
+            return original
+        return super().__new__(cls)
+
+    def __init__(self, original: Callable[P, T], new: Callable[P, T]):
+        self.original = original
+        self.new = new
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> T:
+        try:
+            return self.new(*args, **kwargs)
+        except Exception:
+            return self.original(*args, **kwargs)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._original, attr)
+
+    @property
+    def original(self) -> Callable[P, T]:
+        original = self._original
+        try:
+            self.__code
+        except AttributeError:
+            return original
+        else:
+            assert isinstance(original, types.FunctionType)
+            func = types.FunctionType(
+                self.__code,
+                original.__globals__,
+                argdefs=original.__defaults__,
+                closure=original.__closure__,
+            )
+            if self.__kwdefaults is not None:
+                func.__kwdefaults__ = self.__kwdefaults
+            return func
+
+    @original.setter
+    def original(self, original: Callable[P, T]) -> None:
+        if self in self.patchers:
+            raise RuntimeError("Cannot change original after patching")
+        try:
+            del self.__code
+            del self.__kwdefaults
+        except AttributeError:
+            pass
+        if hasattr(original, "__code__"):
+            self.__code = original.__code__
+            self.__kwdefaults = original.__kwdefaults__
+        elif not hasattr(original, "__self__"):
+            raise TypeError(f"Unsupported type for original: {type(original)}")
+        self._original = original
+
+    def patch(self) -> None:
+        original = self._original
+        try:
+            self.__code
+        except AttributeError:
+            setattr(original.__self__, original.__name__, self)
+        else:
+            # this is the second dumbest code I've ever written
+
+            def caller(*args: P.args, __self: "Patcher[T, P]" = self, **kwargs: P.kwargs) -> T:
+                return __self(*args, **kwargs)
+
+            original.__code__ = caller.__code__
+            original.__kwdefaults__ = {**(original.__kwdefaults__ or {}), **caller.__kwdefaults__}
+        self.patchers.add(self)
+
+    def unpatch(self):
+        original = self._original
+        try:
+            self.__code
+        except AttributeError:
+            setattr(original.__self__, original.__name__, original)
+        else:
+            original.__code__ = self.__code
+            if self.__kwdefaults is not None:
+                original.__kwdefaults__ = self.__kwdefaults
+            else:
+                del original.__kwdefaults__
+        self.patchers.remove(self)
+
+    def __repr__(self) -> str:
+        return repr(self._original)
+
+
+def _displayhook(obj: Any) -> None:
+    if obj is not None:
+        _console = ctxconsole.get()
+        builtins._ = None
+        rich.pretty.pprint(obj, console=_console)
+        builtins._ = obj
+
+
+def _get_console() -> rich.console.Console:
+    return ctxconsole.get()
+
+
+def patch_hooks():
+    # monkeypatching is 👌
+    Patcher(sys.displayhook, _displayhook).patch()
+    Patcher(rich.get_console, _get_console).patch()
+
+
+def reset_hooks():
+    try:
+        for patched in list(Patcher.patchers):
+            logger.debug("Unpatching: %r", patched)
+            patched.unpatch()
+    except Exception:
+        logger.critical(
+            "Error resetting hooks - please report this error and restart your bot", exc_info=True
+        )
+    else:
+        logger.debug("Hooks reset successfully")
+
+
+class Exit(BaseException):
+    pass
 
 
 # This is taken straight from stdlib's codeop,
@@ -34,49 +209,29 @@ class Compiler:
         self.flags = self.default_flags | flags
 
     def __call__(self, source, filename, mode, flags: int = 0):
-        self.flags |= flags
-        codeob = compile(source, filename, mode, self.flags, 1, 0)
-        for feature in _features:
-            if codeob.co_flags & feature.compiler_flag:
-                self.flags |= feature.compiler_flag
+        codeob = compile(source, filename, mode, self.flags | flags, 1, 0)
+        try:
+            co_flags = codeob.co_flags
+        except AttributeError:
+            pass
+        else:
+            for feature in _features:
+                if co_flags & feature.compiler_flag:
+                    self.flags |= feature.compiler_flag
         return codeob
 
 
 class Env(Dict[str, Any]):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.imported = []
+        self.imported: List[str] = []
 
-    @classmethod
-    def from_context(cls, ctx: commands.Context, /, **kwargs: Any) -> "Env":
-        self = cls(
-            {
-                # "_": None,  # let __builtins__ handle this one
-                "ctx": ctx,
-                "author": ctx.author,
-                "bot": ctx.bot,
-                "channel": ctx.channel,
-                "guild": ctx.guild,
-                "me": ctx.me,
-                "message": ctx.message,
-                "asyncio": asyncio,  # not including this can cause errors with async-compile
-                "discord": discord,  # not necessary, but people generally assume this
-                "__name__": "__main__",  # not including this can cause errors with typing (#3648)
-                # eval and exec automatically put this in, but types.FunctionType does not
-                "__builtins__": builtins,
-                # fill in various other environment keys that some code might expect
-                "__builtin__": builtins,
-                "__doc__": ctx.command.help,
-                "__package__": None,
-                "__loader__": None,
-                "__spec__": None,
-            },
-            **kwargs,
-        )
-        return self
-
-    def __missing__(self, key):
+    def __missing__(self, key: str):
+        if key in ("exit", "quit"):
+            raise Exit()
         try:
+            # this is called implicitly after KeyError, but
+            # some modules would overwrite builtins (e.g. bin)
             return getattr(builtins, key)
         except AttributeError:
             pass
@@ -88,264 +243,268 @@ class Env(Dict[str, Any]):
             self.imported.append(key)
             self[key] = module
             return module
-        dotkey = "." + key
-        for tlms in ["redbot", "discord"]:
-            modules = [
-                v for k, v in sys.modules.items() if k.endswith(dotkey) and k.startswith(tlms)
-            ]
-            if len(modules) == 1:
-                module = modules[0]
-                self.imported.append(f"{module.__name__} as {key}")
-                self[key] = module
-                return module
+        try:
+            if cog := self["bot"].get_cog(key):
+                return cog
+        except (AttributeError, KeyError):
+            pass
         raise KeyError(key)
 
-    def get_formatted_imports(self) -> Optional[str]:
-        if not self.imported:
-            return None
-        self.imported.sort()
-        message = "\n".join(map("import {}".format, self.imported))
-        self.imported.clear()
+    def get_formatted_imports(self) -> str:
+        if not (imported := self.imported):
+            return ""
+        imported.sort()
+        message = "".join(f">>> import {import_}\n" for import_ in imported)
+        imported.clear()
         return message
 
 
 class Dev(dev_commands.Dev):
     """Various development focused utilities."""
 
-    # Schema: [my version] <[targeted bot version]>
-    __version__ = "0.0.2 <3.4.1dev>"
+    _last_result: Any
+    sessions: Dict[int, bool]
+    env_extensions: Dict[str, Callable[[commands.Context], Any]]
 
-    def __init__(self):
+    def __init__(self, bot: Red):
+        self.bot = bot
         super().__init__()
-        del self._last_result  # we don't need this anymore
-        self.sessions = {}
 
-    def format_help_for_context(self, ctx: commands.Context) -> str:
-        pre = super().format_help_for_context(ctx)
-        if pre:
-            return f"{pre}\nCog Version: {self.__version__}"
-        else:
-            return f"Cog Version: {self.__version__}"
+    @log_exceptions
+    def cog_unload(self) -> None:
+        self.sessions.clear()
+        core_dev = dev_commands.Dev()
+        core_dev.env_extensions = self.env_extensions
+        self.bot.add_cog(core_dev)
 
-    async def my_exec(self, ctx: commands.Context, *args, **kwargs) -> None:
-        tasks = [
-            ctx.bot.wait_for("message", check=MessagePredicate.cancelled(ctx)),
-            self._my_exec(ctx, *args, **kwargs),
+    async def my_exec(self, ctx: commands.Context, *args, **kwargs) -> bool:
+        tasks: List[asyncio.Task] = [
+            asyncio.create_task(
+                ctx.bot.wait_for("message", check=MessagePredicate.cancelled(ctx))
+            ),
+            asyncio.create_task(self._my_exec(ctx, *args, **kwargs)),
         ]
         async with ctx.typing():
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
-        for task in done:
-            result = task.result()
-            if not result:
-                # _my_exec finished
-                return
-            # wait_for finished
-            assert isinstance(result, discord.Message)
-            if not ctx.channel.permissions_for(
-                ctx.me
-            ).add_reactions or not await ctx.react_quietly("\N{CROSS MARK}"):
-                await ctx.send("Cancelled.")
+        result = done.pop().result()
+        if isinstance(result, bool):
+            return result
+        # wait_for finished
+        # do nothing
+        return False
 
     async def _my_exec(
         self,
         ctx: commands.Context,
-        source,
-        env: Dict[str, Any],
-        *modes: str,
-        run: str = None,
-        compiler: Compiler = None,
+        source: str,
+        env: Env,
+        compiler: Optional[Compiler] = None,
         **environ: Any,
-    ) -> None:
+    ) -> bool:
+        assert ctx.invoked_with
         compiler = compiler or Compiler()
-        original_message = discord.utils.get(ctx.bot.cached_messages, id=ctx.message.id)
-        if original_message:
-            is_alias = not original_message.content.startswith(ctx.prefix + ctx.invoked_with)
-        else:
-            is_alias = False
+        is_alias = False
+        if ctx.command is not self.repl:
+            if original_message := discord.utils.get(ctx.bot.cached_messages, id=ctx.message.id):
+                is_alias = not original_message.content.startswith(ctx.prefix + ctx.invoked_with)
         message = environ.get("message", ctx.message)
-        if not modes:
-            modes = ("single",)
-        # [Imports, Prints, Errors, Result]
-        ret: List[Optional[str]] = [None, None, None, None]
         env.update(environ)
-        stdout = io.StringIO()
-        filename = f"<{ctx.command}>"
-        try:
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
-                exc = None
-                for mode in modes:
-                    try:
-                        compiled = compiler(source, filename, mode)
-                        output = await self.maybe_await(types.FunctionType(compiled, env)())
-                    except SyntaxError as e:
-                        exc = e
-                        continue
-                    else:
-                        if run:
-                            # don't call the func here, leave it to maybe_await
-                            output = await self.maybe_await(env[run]())
-                        if output is not None:
-                            setattr(builtins, "_", output)
-                            ret[3] = f"# Result:\n{output!r}"
-                        break
+        exited = False
+        filename = f"<{ctx.invoked_with}>"
+
+        if isinstance(ctx.author, discord.Member):
+            mobile = ctx.author.is_on_mobile()
+        else:
+            mobile = next(
+                filter(
+                    None,
+                    map(discord.Guild.get_member, ctx.bot.guilds, itertools.repeat(ctx.author.id)),
+                )
+            ).is_on_mobile()
+
+        kwargs: Dict[str, Any] = {
+            "width": 37 if mobile else 80,
+            "no_color": mobile,
+            "color_system": "auto" if mobile else "standard",
+            "tab_size": 2,
+            "soft_wrap": False,
+        }
+        if _console_custom := env.get("_console_custom"):
+            try:
+                kwargs.update(_console_custom)
+            except Exception:
+                logger.exception("Error updating console kwargs: falling back to default values")
+
+        async with redirect(**kwargs) as console:
+            assert isinstance(console.file, io.StringIO)
+            try:
+                if source.startswith("from __future__ import"):
+                    self.handle_future(source, compiler)
+                if ctx.command is self._eval:
+                    await self._eval_exec(source, env, filename, compiler)
                 else:
-                    if exc:
-                        raise exc
-        except BaseException as e:
-            # return only frames that are part of provided code
-            i, j = -1, 0
-            for j, (frame, _) in enumerate(traceback.walk_tb(e.__traceback__)):
-                if i < 0 and frame.f_code.co_filename == filename:
-                    i = j
-            if i < 0:
-                # this shouldn't ever happen but python allows for some weirdness
-                limit = 0
-            elif run:
-                # the func frame isn't needed
-                limit = i - j
+                    await self._debug_exec(source, env, filename, compiler)
+            except (Exit, SystemExit):
+                exited = True
+            except KeyboardInterrupt:
+                raise
+            except:
+                self._output_exception(ctx, console, filename)
+            if is_alias:
+                output = console.file.getvalue()
             else:
-                limit = i - j - 1
-            tb = e.__traceback__ if limit else None
-            ret[2] = "".join(
-                chain(["# Exception:\n"], traceback.format_exception(type(e), e, tb, limit))
+                with console.capture() as captured:
+                    console.print(
+                        rich.syntax.Syntax(
+                            env.get_formatted_imports(), "pycon", theme=SolarizedCustom
+                        )
+                    )
+                output = captured.get() + console.file.getvalue()
+        asyncio.ensure_future(
+            self.send_interactive(
+                ctx, output.strip(), message, box_lang="py" if mobile else "ansi"
             )
-        # don't export imports on aliases
-        if (
-            not is_alias
-            and (method := getattr(env, "get_formatted_imports", None))
-            and (imported := method())
-        ):
-            ret[0] = f"# Imported:\n{imported}"
-        printed = stdout.getvalue().strip()
-        if printed:
-            ret[1] = "# Output:\n" + printed
-        asyncio.ensure_future(self.send_interactive(ctx, *ret, message=message))
+        )
+        return exited
+
+    def _output_exception(
+        self, ctx: commands.Context, console: rich.console.Console, filename: str
+    ) -> None:
+        exc_type, e, tb = sys.exc_info()
+        # return only frames that are part of provided code
+        while tb:
+            if tb.tb_frame.f_code.co_filename == filename:
+                break
+            tb = tb.tb_next
+        if tb and ctx.command is self._eval:
+            tb = tb.tb_next or tb  # skip the func() frame if we can
+        rich_tb = rich.traceback.Traceback.from_exception(
+            exc_type, e, tb, extra_lines=1, theme=SolarizedCustom
+        )
+        console.print(rich_tb)
+
+    async def _debug_exec(self, source: str, env: Env, filename: str, compiler: Compiler) -> None:
+        tree: ast.Module = compiler(source, filename, "exec", flags=ast.PyCF_ONLY_AST)
+        if header := tree.body[:-1]:
+            body = ast.Module(header, tree.type_ignores)
+            compiled = compiler(body, filename, "exec")
+            await self.maybe_await(types.FunctionType(compiled, env)())
+        node = tree.body[-1]
+        if isinstance(node, ast.Expr):
+            compiled = compiler(ast.Expression(node.value), filename, "eval")
+        else:
+            # theoretically, the entire module body could just be thrown here
+            # but that would not be backwards compatible with core dev
+            compiled = compiler(ast.Interactive([node]), filename, "single")
+        await self.maybe_await(types.FunctionType(compiled, env)())
+
+    async def _eval_exec(self, source: str, env: Env, filename: str, compiler: Compiler) -> None:
+        source = "async def func():\n" + textwrap.indent(source, "  ")
+        compiled = compiler(source, filename, "exec")
+        # this Function will never be a coroutine
+        types.FunctionType(compiled, env)()
+
+        await self.maybe_await(env["func"]())
 
     async def send_interactive(
         self,
         ctx: commands.Context,
-        *items: Optional[str],
-        message: discord.Message = None,
+        output: str,
+        message: Optional[discord.Message] = None,
+        box_lang: str = "",
     ) -> None:
+        # \u02CB = modifier letter grave accent
+        output = output and self.sanitize_output(ctx, output).replace("```", "\u02CB\u02CB\u02CB")
         message = message or ctx.message
-        if message.channel != ctx.channel:
-            raise RuntimeError("\N{THINKING FACE} how did this happen")
+        assert message.channel == ctx.channel
         try:
-            if not any(items):
+            if output:
+                await ctx.send_interactive(self.get_pages(output), box_lang=box_lang)
+            else:
                 if ctx.channel.permissions_for(ctx.me).add_reactions:
                     with contextlib.suppress(discord.HTTPException):
                         await message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
                         return
                 await ctx.send("Done.")
-                return
-            for item in filter(None, items):
-                await ctx.send_interactive(
-                    self.get_pages(
-                        self.sanitize_output(ctx, item.replace("```", "`\u200b`\u200b`"))
-                    ),
-                    box_lang="py",
-                )
         except discord.Forbidden:
             # if this is repl, stop it
             self.sessions.pop(ctx.channel.id, None)
 
     @staticmethod
-    async def maybe_await(coro):
+    def get_pages(msg: str):
+        """Pagify the given message for output to the user."""
+        return pagify(msg, delims=["\n", " "], priority=True, shorten_by=12)
+
+    @staticmethod
+    async def maybe_await(coro: Any, *, hook: Callable[[Any], None] = _displayhook) -> None:
+        if coro is None:
+            return
         if inspect.isasyncgen(coro):
-            async for obj in coro:
-                if obj is not None:
-                    setattr(builtins, "_", obj)
-                    print(repr(obj))
-
+            async for result in coro:
+                hook(result)
         elif inspect.isawaitable(coro):
-            return await coro
-
-        elif inspect.isgenerator(coro):
-            for obj in coro:
-                if obj is not None:
-                    setattr(builtins, "_", obj)
-                    print(repr(obj))
-
+            hook(await coro)
         else:
-            return coro
+            hook(coro)
+
+    def cleanup_code(self, code: str) -> str:
+        code = super().cleanup_code(code)
+        # also from stdlib's codeop
+        # compiling nocode with "eval" does weird things
+        with io.StringIO(code) as codeio:
+            for line in codeio:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    break
+            else:
+                return "pass"
+        return code
+
+    def get_environment(self, ctx: commands.Context) -> Env:
+        base_env = super().get_environment(ctx)
+        del base_env["_"]
+        env = Env(
+            {
+                "me": ctx.me,
+                # redirect builtin console functions to rich
+                "print": rich.print,
+                "help": functools.partial(rich.inspect, help=True),
+                # eval and exec automatically put this in, but types.FunctionType does not
+                "__builtins__": builtins,
+                # fill in various other environment keys that some code might expect
+                "__builtin__": builtins,
+                "__doc__": ctx.command.help,
+                "__package__": None,
+                "__loader__": None,
+                "__spec__": None,
+            }
+        )
+        env.update(base_env)
+        return env
 
     @commands.command()
     @commands.is_owner()
-    async def debug(self, ctx, *, code):
-        """
-        Evaluate a statement of python code as if it were entered into a REPL.
+    @discord.utils.copy_doc(dev_commands.Dev.debug.callback)
+    async def debug(self, ctx: commands.Context, *, code: str):
+        env = self.get_environment(ctx)
+        code = self.cleanup_code(code)
 
-        Environment Variables:
-            ctx      - command invokation context
-            bot      - bot object
-            message  - the command's message object
-            guild    - the current guild, or None in direct messages
-            channel  - the current channel object
-            author   - command author's member object
-            commands - redbot.core.commands
-            _        - The result of the last dev command.
-        """
-        env = Env.from_context(ctx, commands=commands)
-        code = self.cleanup_code(code).strip()
-
-        compiler = Compiler()
-        if code.startswith("from __future__ import"):
-            try:
-                code = self.handle_future(code, compiler)
-            except SyntaxError as e:
-                await self.send_interactive(
-                    ctx,
-                    "# Exception:\nTraceback (most recent call last):\n"
-                    + "".join(traceback.format_exception_only(type(e), e)),
-                )
-                return
-
-        await self.my_exec(ctx, code, env, "eval", "single", compiler=compiler)
+        await self.my_exec(ctx, code, env)
 
     @commands.command(name="eval")
     @commands.is_owner()
+    @discord.utils.copy_doc(dev_commands.Dev._eval.callback)
     async def _eval(self, ctx, *, body: str):
-        """
-        Execute asynchronous code.
+        env = self.get_environment(ctx)
+        body = self.cleanup_code(body)
 
-        This command wraps code into the body of an async function and then
-        calls and awaits it. The bot will respond with anything printed to
-        stdout, as well as the return value of the function.
-
-        The code can be within a codeblock, inline code or neither, as long
-        as they are not mixed and they are formatted correctly.
-
-        Environment Variables:
-            ctx      - command invokation context
-            bot      - bot object
-            channel  - the current channel object
-            author   - command author's member object
-            message  - the command's message object
-            commands - redbot.core.commands
-            _        - The result of the last dev command.
-        """
-        env = Env.from_context(ctx, commands=commands)
-        body = self.cleanup_code(body).strip()
-
-        compiler = Compiler()
-        if body.startswith("from __future__ import"):
-            try:
-                body = self.handle_future(body, compiler)
-            except SyntaxError as e:
-                await self.send_interactive(
-                    ctx,
-                    "# Exception:\nTraceback (most recent call last):\n"
-                    + "".join(traceback.format_exception_only(type(e), e)),
-                )
-                return
-
-        to_compile = "async def func():\n" + textwrap.indent(body, "  ")
-        await self.my_exec(ctx, to_compile, env, "exec", compiler=compiler, run="func")
+        await self.my_exec(ctx, body, env)
 
     @staticmethod
     def handle_future(code: str, compiler: Compiler) -> str:
+        # TODO: Maybe compile out future imports using ast?
         exc = None
         lines = code.splitlines(keepends=True)
         for i in range(len(lines)):
@@ -358,32 +517,34 @@ class Dev(dev_commands.Dev):
             else:
                 return "".join(lines[i + 1 :])
         # it couldn't be compiled out for whatever reason
-        raise exc or RuntimeError("\N{THINKING FACE} how did this happen")
-
-    def cog_unload(self):
-        self.sessions.clear()
+        raise exc or AssertionError("\N{THINKING FACE} how did this happen")
 
     @commands.group(invoke_without_command=True)
     @commands.is_owner()
-    async def repl(self, ctx):
-        """
-        Open an interactive REPL.
-
-        The REPL will only recognise code as messages which start with a
-        backtick. This includes codeblocks, and as such multiple lines can be
-        evaluated.
-        """
+    @discord.utils.copy_doc(dev_commands.Dev.repl.callback)
+    async def repl(self, ctx: commands.Context):
         if ctx.channel.id in self.sessions:
-            await ctx.send(
-                _("Already running a REPL session in this channel. Exit it with `quit`.")
-            )
+            if self.sessions[ctx.channel.id]:
+                await ctx.send(
+                    _("Already running a REPL session in this channel. Exit it with `quit`.")
+                )
+            else:
+                await ctx.send(
+                    _(
+                        "Already running a REPL session in this channel. Resume the REPL with `{}repl resume`."
+                    ).format(ctx.clean_prefix)
+                )
             return
 
-        variables = Env.from_context(ctx)
+        variables = self.get_environment(ctx)
         compiler = Compiler()
 
         self.sessions[ctx.channel.id] = True
-        await ctx.send(_("Enter code to execute or evaluate. `exit()` or `quit` to exit."))
+        await ctx.send(
+            _(
+                "Enter code to execute or evaluate. `exit` or `quit` to exit. `{}repl pause` to pause."
+            ).format(ctx.clean_prefix)
+        )
 
         while True:
             response = await ctx.bot.wait_for("message", check=MessagePredicate.regex(r"^`", ctx))
@@ -393,79 +554,17 @@ class Dev(dev_commands.Dev):
             if not self.sessions[ctx.channel.id]:
                 continue
 
-            cleaned = self.cleanup_code(response.content).strip()
+            cleaned = self.cleanup_code(response.content)
 
-            if cleaned.rstrip("( )") in ("quit", "exit", "stop"):
-                del self.sessions[ctx.channel.id]
-                await ctx.send(_("Exiting."))
-                return
-
-            if cleaned.startswith("from __future__ import"):
-                try:
-                    cleaned = self.handle_future(cleaned, compiler)
-                except SyntaxError as e:
-                    asyncio.ensure_future(
-                        self.send_interactive(
-                            ctx,
-                            "# Exception:\nTraceback (most recent call last):\n"
-                            + "".join(traceback.format_exception_only(type(e), e)),
-                        )
-                    )
-                    continue
-
-            await self.my_exec(
+            exited = await self.my_exec(
                 ctx,
                 cleaned,
                 variables,
-                "eval",
-                "single",
-                "exec",
                 compiler=compiler,
                 message=response,
             )
 
-    # The below command is unchanged from NeuroAssassin's code.
-    # It is present here mainly as a backport for previous versions of Red.
-    @repl.command(aliases=["resume"])
-    async def pause(self, ctx, toggle: Optional[bool] = None):
-        """Pauses/resumes the REPL running in the current channel"""
-        if ctx.channel.id not in self.sessions:
-            await ctx.send(_("There is no currently running REPL session in this channel."))
-            return
-
-        if toggle is None:
-            toggle = not self.sessions[ctx.channel.id]
-        self.sessions[ctx.channel.id] = toggle
-
-        if toggle:
-            await ctx.send(_("The REPL session in this channel has been resumed."))
-        else:
-            await ctx.send(_("The REPL session in this channel is now paused."))
-
-    @commands.command()
-    @commands.is_owner()
-    async def mock(self, ctx: commands.Context, user: discord.Member, *, command: str):
-        """
-        Mock another user invoking a command.
-
-        The prefix must not be entered.
-        """
-        if user.bot:
-            return
-
-        msg = copy(ctx.message)
-        msg.author = user
-        msg.content = ctx.prefix + command
-
-        new_ctx = await ctx.bot.get_context(msg)
-        await ctx.bot.invoke(new_ctx)
-
-    @commands.command(name="mockmsg")
-    @commands.is_owner()
-    async def mock_msg(self, ctx: commands.Context, user: discord.Member, *, content: str):
-        """Dispatch a message event as if it were sent by a different user."""
-        msg = copy(ctx.message)
-        msg.author = user
-        msg.content = content
-
-        ctx.bot.dispatch("message", msg)
+            if exited:
+                del self.sessions[ctx.channel.id]
+                await ctx.send(_("Exiting."))
+                return

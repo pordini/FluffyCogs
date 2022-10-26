@@ -5,7 +5,7 @@ import itertools
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Union
+from typing import Optional
 
 import discord
 from redbot.core import commands
@@ -52,7 +52,14 @@ async def history(channel, **kwargs):
     return d
 
 
-MaybeMessage = Optional[Union[int, discord.Message]]  # yes, this order is intentional
+# The below effectively makes for an owner-only command in guilds,
+# but one that can be overwritten with permissions
+def logsfrom_check():
+    @commands.permissions_check
+    def predicate(ctx):
+        return ctx.guild is None
+
+    return predicate
 
 
 @cog_i18n(_T)
@@ -63,12 +70,13 @@ class LogsFrom(commands.Cog):
     async def red_delete_data_for_user(self, *, requester, user_id):
         pass  # No data to delete
 
+    @logsfrom_check()
     @commands.command(usage="[bounds...] [channel]")
     async def logsfrom(
         self,
         ctx,
-        after: MaybeMessage = None,
-        before: MaybeMessage = None,
+        after: Optional[discord.PartialMessage] = None,
+        before: Optional[discord.PartialMessage] = None,
         *,
         channel: discord.TextChannel = None,
     ):
@@ -124,10 +132,7 @@ class LogsFrom(commands.Cog):
                 return await ctx.send(_T("Okay, I've cancelled my logging."))
             messages = message_task.result()
             processed = 0
-            if kwargs["oldest_first"]:
-                pop = messages.popleft
-            else:
-                pop = messages.pop
+            pop = messages.popleft if kwargs["oldest_first"] else messages.pop
             while messages:
                 await asyncio.sleep(0)
                 if cancel_task.done():

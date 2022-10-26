@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from itertools import chain, filterfalse
 from typing import List
 
 import discord
@@ -13,6 +12,8 @@ _ = Translator(__name__, __file__)
 
 
 class Limited(discord.abc.Messageable):
+    __slots__ = ("author", "channel")
+
     def __init__(self, **kwargs):
         super().__init__()
         if message := kwargs.pop("message", None):
@@ -29,13 +30,14 @@ class Limited(discord.abc.Messageable):
         return hash((self.author, self.channel))
 
     def __eq__(self, o: object) -> bool:
-        if isinstance(o, Limited):
-            return (self.author, self.channel) == (o.author, o.channel)
         if isinstance(o, discord.abc.User):
             return self.author == o or self.channel == o
-        if isinstance(o, (discord.TextChannel, discord.abc.PrivateChannel)):
+        if isinstance(o, (discord.TextChannel, discord.DMChannel)):
             return self.channel == o
-        return (self.author, self.channel) == (o.author, o.channel)
+        try:
+            return (self.author, self.channel) == (o.author, o.channel)  # type: ignore
+        except AttributeError:
+            return NotImplemented
 
     def __str__(self) -> str:
         return f"{self.author}, in {self.channel}"
@@ -50,7 +52,7 @@ class Limited(discord.abc.Messageable):
 class DiscordConverter(commands.Converter):
     @classmethod
     async def convert(
-        cls, ctx, argument: str, *, globally: bool = True
+        cls, ctx: commands.Context, argument: str, *, globally: bool = True
     ) -> discord.abc.Messageable:
         results = await cls.search(ctx, argument, globally=globally)
         if len(results) == 0:
@@ -66,18 +68,22 @@ class DiscordConverter(commands.Converter):
                 m = f"{m}, in {guild}"
             message = f"{message}\n{m}"
         await ctx.send(message)
-        predicate = MessagePredicate.less(len(results), ctx=ctx)
+        predicate = MessagePredicate.valid_int(ctx=ctx)
         try:
             await ctx.bot.wait_for("message", check=predicate, timeout=30)
         except asyncio.TimeoutError as te:
             m = _("No destination selected.")
             await ctx.send(m)
             raise commands.BadArgument(m)
-        return results[predicate]
+        result = predicate.result
+        try:
+            return results[result]
+        except IndexError:
+            raise commands.BadArgument(f"{result} is not a number in the list.") from None
 
     @classmethod
     async def search(
-        cls, ctx, argument: str, *, globally: bool = False
+        cls, ctx: commands.Context, argument: str, *, globally: bool = False
     ) -> List[discord.abc.Messageable]:
         is_owner = await ctx.bot.is_owner(ctx.author)
         is_nsfw = getattr(ctx.channel, "nsfw", False)
@@ -89,10 +95,7 @@ class DiscordConverter(commands.Converter):
         blacklists = await asyncio.gather(
             config.all_guilds(), config.all_channels(), config.all_users()
         )
-        if globally:
-            guilds = ctx.bot.guilds
-        else:
-            guilds = [ctx.guild]
+        guilds = ctx.bot.guilds if globally else [ctx.guild]
         results = set()
         for guild in guilds:
             if blacklists[0].get(guild.id, {}).get("blacklisted"):

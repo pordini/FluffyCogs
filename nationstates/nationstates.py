@@ -1,5 +1,7 @@
 import asyncio
 import bisect
+import heapq
+import operator
 import re
 import time
 from datetime import datetime
@@ -68,7 +70,7 @@ LINK_RE = re.compile(
     r'(?i)["<]?\b(?:https?:\/\/)?(?:www\.)?nationstates\.net\/(?:(nation|region)=)?([-\w\s]+)\b[">]?'
 )
 WA_RE = re.compile(r"(?i)\b(UN|GA|SC)R?#(\d+)\b")
-ZDAY_EPOCHS = (1572465600, 1572584400 + 604800)
+ZDAY_START = 1635627600
 T = TypeVar("T", bound=Options)
 
 
@@ -136,15 +138,14 @@ class NationStates(commands.Cog):
         if xra:
             raise commands.CommandOnCooldown(None, time.time() - xra)
 
-    def cog_command_error(self, ctx, error):
-        # not a coro but returns one anyway
+    async def cog_command_error(self, ctx: commands.Context, error: commands.CommandError):
         original = getattr(error, "original", None)
         if original:
             if isinstance(original, asyncio.TimeoutError):
                 return ctx.send("Request timed out.")
             if isinstance(original, HTTPException):
                 return ctx.send(f"{original.status}: {original.message}")
-        return ctx.bot.on_command_error(ctx, error, unhandled_by_cog=True)
+        return await ctx.bot.on_command_error(ctx, error, unhandled_by_cog=True)
 
     # __________ UTILS __________
 
@@ -159,14 +160,15 @@ class NationStates(commands.Cog):
         return "{} {}".format(round(num, 3), illion[index])
 
     @staticmethod
-    def _is_zday(snowflake: discord.abc.Snowflake):
+    def _is_zday(snowflake: discord.abc.Snowflake, *, dev: bool = False):
         epoch = snowflake.created_at.timestamp()
-        return epoch >= ZDAY_EPOCHS[0] and epoch < ZDAY_EPOCHS[1]
+        start, end = ZDAY_START - 259200 * dev, ZDAY_START + 723600
+        return start <= epoch < end
 
     # __________ LISTENERS __________
 
     @commands.Cog.listener()
-    async def on_message_without_command(self, message):
+    async def on_message_without_command(self, message: discord.Message):
         if message.author.bot:
             return
         if not await self.bot.message_eligible_as_command(
@@ -195,7 +197,7 @@ class NationStates(commands.Cog):
     @commands.command(cooldown_after_parsing=True)
     @commands.cooldown(2, 3600)
     @checks.is_owner()
-    async def agent(self, ctx, *, agent: str):
+    async def agent(self, ctx: commands.Context, *, agent: str):
         """
         Sets the user agent.
 
@@ -207,7 +209,7 @@ class NationStates(commands.Cog):
         await ctx.send(f"Agent set: {Api.agent}")
 
     @commands.command()
-    async def nation(self, ctx, *, nation: Link[Nation]):
+    async def nation(self, ctx: commands.Context, *, nation: Link[Nation]):
         """Retrieves general info about a specified NationStates nation"""
         api: Api = Api(
             "census category dbid",
@@ -239,6 +241,7 @@ class NationStates(commands.Cog):
         else:
             endo = "{:.0f} endorsements".format(endo)
         founded = root.FOUNDED.pyval or "in Antiquity"
+        is_zday = self._is_zday(ctx.message, dev=ctx.author.id == 215640856839979008)
         embed = ProxyEmbed(
             title=root.FULLNAME.text,
             url="https://www.nationstates.net/nation={}".format(root.get("id")),
@@ -251,7 +254,7 @@ class NationStates(commands.Cog):
                 founded,
             ),
             timestamp=datetime.utcfromtimestamp(root.LASTLOGIN.pyval),
-            colour=0x8BBC21 if self._is_zday(ctx.message) else await ctx.embed_colour(),
+            colour=0x8BBC21 if is_zday else await ctx.embed_colour(),
         )
         embed.set_author(name="NationStates", url="https://www.nationstates.net/")
         embed.set_thumbnail(url=root.FLAG.text)
@@ -271,16 +274,16 @@ class NationStates(commands.Cog):
             ),
             inline=False,
         )
-        if self._is_zday(ctx.message):
+        if is_zday:
             embed.add_field(
                 name="{}{}".format(
-                    (root.find("ZOMBIE/ZACTION") or "No Action").title(),
-                    " (Unintended)" if root.find("ZOMBIE/ZACTIONINTENDED") else "",
+                    (root.ZOMBIE.ZACTION.text or "No Action").title(),
+                    " (Unintended)" if root.ZOMBIE.ZACTIONINTENDED.text else "",
                 ),
                 value="Survivors: {} | Zombies: {} | Dead: {}".format(
-                    self._illion(root.find("ZOMBIE/SURVIVORS")),
-                    self._illion(root.find("ZOMBIE/ZOMBIES")),
-                    self._illion(root.find("ZOMBIE/DEAD")),
+                    self._illion(root.ZOMBIE.SURVIVORS),
+                    self._illion(root.ZOMBIE.ZOMBIES),
+                    self._illion(root.ZOMBIE.DEAD),
                 ),
                 inline=False,
             )
@@ -297,7 +300,7 @@ class NationStates(commands.Cog):
         await embed.send_to(ctx)
 
     @commands.command()
-    async def region(self, ctx, *, region: Link[Region]):
+    async def region(self, ctx: commands.Context, *, region: Link[Region]):
         """Retrieves general info about a specified NationStates region"""
         api: Api = Api(
             "delegate delegateauth delegatevotes flag founded founder founderauth lastupdate name numnations power tags zombie",
@@ -328,10 +331,7 @@ class NationStates(commands.Cog):
             delheader = "Delegate (Non-Executive)"
         tags = {t.text for t in root.iterfind("TAGS/TAG")}
         founderless = "Founderless" in tags
-        if root.FOUNDED.pyval == 0:
-            founded = "in Antiquity"
-        else:
-            founded = root.FOUNDED.pyval
+        founded = "in Antiquity" if root.FOUNDED.pyval == 0 else root.FOUNDED.pyval
         if root.FOUNDER.text == "0":
             foundervalue = "No Founder"
         else:
@@ -345,44 +345,40 @@ class NationStates(commands.Cog):
                 root.FOUNDER.text,
                 " (Ceased to Exist)" if founderless else "",
             )
-        if founderless:
-            founderheader = "Founderless"
-        else:
-            founderheader = "Founder"
+        founderheader = "Founderless" if founderless else "Founder"
         if not root.FOUNDERAUTH.text or "X" not in root.FOUNDERAUTH.text:
             founderheader += " (Non-Executive)"
         fash = "Fascist" in tags and "Anti-Fascist" not in tags  # why do people hoard tags...
         name = "{}{}".format("\N{LOCK} " if "Password" in tags else "", root.NAME.text)
-        if fash:
-            warning = "\n**```css\n\N{HEAVY EXCLAMATION MARK SYMBOL} Region Tagged as Fascist \N{HEAVY EXCLAMATION MARK SYMBOL}\n```**"
-        else:
-            warning = ""
+        warning = (
+            "\n**```css\n\N{HEAVY EXCLAMATION MARK SYMBOL} Region Tagged as Fascist \N{HEAVY EXCLAMATION MARK SYMBOL}\n```**"
+            if fash
+            else ""
+        )
+
         description = "[{} nations](https://www.nationstates.net/region={}/page=list_nations) | Founded {} | Power: {}{}".format(
             root.NUMNATIONS.pyval, root.get("id"), founded, root.POWER.text, warning
         )
+        is_zday = self._is_zday(ctx.message, dev=ctx.author.id == 215640856839979008)
         embed = ProxyEmbed(
             title=name,
             url="https://www.nationstates.net/region={}".format(root.get("id")),
             description=description,
             timestamp=datetime.utcfromtimestamp(root.LASTUPDATE.pyval),
-            colour=0x000001
-            if fash
-            else 0x8BBC21
-            if self._is_zday(ctx.message)
-            else await ctx.embed_colour(),
+            colour=0x000001 if fash else 0x8BBC21 if is_zday else await ctx.embed_colour(),
         )
         embed.set_author(name="NationStates", url="https://www.nationstates.net/")
         if root.FLAG.text:
             embed.set_thumbnail(url=root.FLAG.text)
         embed.add_field(name=founderheader, value=foundervalue, inline=False)
         embed.add_field(name=delheader, value=delvalue, inline=False)
-        if self._is_zday(ctx.message):
+        if is_zday:
             embed.add_field(
                 name="Zombies",
                 value="Survivors: {} | Zombies: {} | Dead: {}".format(
-                    self._illion(root.find("ZOMBIE/SURVIVORS")),
-                    self._illion(root.find("ZOMBIE/ZOMBIES")),
-                    self._illion(root.find("ZOMBIE/DEAD")),
+                    self._illion(root.ZOMBIE.SURVIVORS),
+                    self._illion(root.ZOMBIE.ZOMBIES),
+                    self._illion(root.ZOMBIE.DEAD),
                 ),
                 inline=False,
             )
@@ -393,7 +389,11 @@ class NationStates(commands.Cog):
 
     @commands.command(usage="[season] <nation>")
     async def card(
-        self, ctx, season: Optional[int] = 2, *, nation: Optional[Union[int, Link[Nation]]] = None
+        self,
+        ctx: commands.Context,
+        season: Optional[int] = 2,
+        *,
+        nation: Optional[Union[int, Link[Nation]]] = None,
     ):
         """
         Retrieves general info about the specified card.
@@ -499,7 +499,7 @@ class NationStates(commands.Cog):
         await embed.send_to(ctx)
 
     @commands.command()
-    async def deck(self, ctx, *, nation: Union[int, Link[Nation]]):
+    async def deck(self, ctx: commands.Context, *, nation: Union[int, Link[Nation]]):
         """Retrieves general info about the specified nation's deck."""
         is_id = isinstance(nation, int)
         if is_id:
@@ -535,7 +535,7 @@ class NationStates(commands.Cog):
     # __________ ASSEMBLY __________
 
     @commands.command(aliases=["ga", "sc"])
-    async def wa(self, ctx, resolution_id: Optional[int] = None, *options: WA):
+    async def wa(self, ctx: commands.Context, resolution_id: Optional[int] = None, *options: WA):
         """
         Retrieves general info about World Assembly resolutions.
 
@@ -562,7 +562,7 @@ class NationStates(commands.Cog):
         else:
             shards.append("lastresolution")
         root = await Api(request, q=shards)
-        if not root.RESOLUTION:
+        if not root.RESOLUTION.countchildren():
             out = (
                 unescape(root.LASTRESOLUTION.text)
                 .replace("<strong>", "**")
@@ -641,14 +641,14 @@ class NationStates(commands.Cog):
             )
         embed.set_thumbnail(url="https://www.nationstates.net/{}".format(img))
         if option & WA.DELEGATE:
-            for_del_votes = sorted(
-                root.iterfind("DELVOTES_FOR/DELEGATE"), key=lambda e: e.VOTES.pyval, reverse=True
-            )[:10]
-            against_del_votes = sorted(
+            for_del_votes = heapq.nlargest(
+                10, root.iterfind("DELVOTES_FOR/DELEGATE"), key=operator.attrgetter("VOTES.pyval")
+            )
+            against_del_votes = heapq.nlargest(
+                10,
                 root.iterfind("DELVOTES_AGAINST/DELEGATE"),
-                key=lambda e: e.VOTES.pyval,
-                reverse=True,
-            )[:10]
+                key=operator.attrgetter("VOTES.pyval"),
+            )
             if for_del_votes:
                 embed.add_field(
                     name="Top Delegates For",
@@ -726,7 +726,7 @@ class NationStates(commands.Cog):
     # __________ SHARD __________
 
     @commands.command()
-    async def shard(self, ctx, *shards: str):
+    async def shard(self, ctx: commands.Context, *shards: str):
         """
         Retrieves the specified info from NationStates
 
@@ -761,7 +761,7 @@ class NationStates(commands.Cog):
     # __________ ENDORSE __________
 
     @commands.command()
-    async def ne(self, ctx, *, wa_nation: str):
+    async def ne(self, ctx: commands.Context, *, wa_nation: str):
         """Nations Endorsing (NE) the specified WA nation"""
         root = await Api("endorsements fullname wa", nation=wa_nation)
         if root.UNSTATUS.text.lower() == "non-member":
@@ -774,7 +774,7 @@ class NationStates(commands.Cog):
         )
 
     @commands.command()
-    async def nec(self, ctx, *, wa_nation: str):
+    async def nec(self, ctx: commands.Context, *, wa_nation: str):
         """Nations Endorsing [Count] (NEC) the specified WA nation"""
         root = await Api("census fullname wa", nation=wa_nation, scale="66", mode="score")
         if root.UNSTATUS.text.lower() == "non-member":
@@ -786,7 +786,7 @@ class NationStates(commands.Cog):
         )
 
     @commands.command()
-    async def spdr(self, ctx, *, nation: str):
+    async def spdr(self, ctx: commands.Context, *, nation: str):
         """Soft Power Disbursement Rating (SPDR, aka numerical Influence) of the specified nation"""
         root = await Api("census fullname", nation=nation, scale="65", mode="score")
         await ctx.send(
@@ -796,7 +796,7 @@ class NationStates(commands.Cog):
         )
 
     @commands.command()
-    async def nne(self, ctx, *, wa_nation: str):
+    async def nne(self, ctx: commands.Context, *, wa_nation: str):
         """Nations Not Endorsing (NNE) the specified WA nation"""
         nation_root = await Api("endorsements fullname region wa", nation=wa_nation)
         if nation_root.UNSTATUS.text.lower() == "non-member":
@@ -814,7 +814,7 @@ class NationStates(commands.Cog):
         )
 
     @commands.command()
-    async def nnec(self, ctx, *, wa_nation: str):
+    async def nnec(self, ctx: commands.Context, *, wa_nation: str):
         """Nations Not Endorsing [Count] (NNEC) the specified WA nation"""
         nation_root = await Api("endorsements fullname region wa", nation=wa_nation)
         if nation_root.UNSTATUS.text.lower() == "non-member":
