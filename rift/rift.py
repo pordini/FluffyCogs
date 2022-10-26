@@ -179,7 +179,7 @@ class Rift(commands.Cog):
     # COMMANDS
 
     @commands.command()
-    async def send(self, ctx: commands.Context, *rifts: Messageable, *message: str):
+    async def send(self, ctx: commands.Context, *rifts: Messageable, message: str):
         """
         Send a message to the specified destinations.
 
